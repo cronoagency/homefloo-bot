@@ -42,6 +42,7 @@ MODAL_ENDPOINT = os.environ.get(
     "MODAL_ENDPOINT",
     "https://cronoagency--homefloo-bot-homefloobot-chat.modal.run",
 )
+MODAL_HEALTH_ENDPOINT = MODAL_ENDPOINT.replace("-chat.", "-health.")
 HOMEFLOO_API = os.environ.get(
     "HOMEFLOO_API",
     "http://gcgoo88g4ow8sccokc0o48c4.91.98.89.69.sslip.io/api/analisi",
@@ -59,6 +60,9 @@ MAX_HISTORY = 20  # max messaggi per sessione (10 turni user+assistant)
 SESSION_EXPIRE_HOURS = 48  # sessioni piu vecchie di 48h vengono scartate
 REQUEST_TIMEOUT = 120  # secondi (cold start puo essere 35s)
 ANALISI_TIMEOUT = 180  # secondi (Claude Sonnet per analisi)
+KEEPWARM_INTERVAL = 240  # secondi (4 minuti)
+KEEPWARM_START_HOUR = 8
+KEEPWARM_END_HOUR = 21
 
 # Marker per dati completi
 DATI_PATTERN = re.compile(r"\[DATI_COMPLETI\]\s*(.*?)\s*\[/DATI_COMPLETI\]", re.DOTALL)
@@ -637,6 +641,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def keepwarm_loop():
+    """Pinga Modal health endpoint ogni 4 min (8-21) per evitare cold start."""
+    import datetime
+    log.info(f"Keepwarm loop avviato (ogni {KEEPWARM_INTERVAL}s, ore {KEEPWARM_START_HOUR}-{KEEPWARM_END_HOUR})")
+    while True:
+        try:
+            await asyncio.sleep(KEEPWARM_INTERVAL)
+            hour = datetime.datetime.now().hour
+            if hour < KEEPWARM_START_HOUR or hour >= KEEPWARM_END_HOUR:
+                continue
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.get(MODAL_HEALTH_ENDPOINT)
+                if resp.status_code != 200:
+                    log.warning(f"Keepwarm FAIL: HTTP {resp.status_code}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning(f"Keepwarm error: {e}")
+
+
 def main():
     """Avvia il bot."""
     if not TELEGRAM_TOKEN:
@@ -651,7 +675,14 @@ def main():
     log.info(f"Data dir: {DATA_DIR}")
     load_sessions()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    async def post_init(application):
+        application.keepwarm_task = asyncio.create_task(keepwarm_loop())
+
+    async def post_shutdown(application):
+        if hasattr(application, "keepwarm_task"):
+            application.keepwarm_task.cancel()
+
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
 
     # Comandi
     app.add_handler(CommandHandler("start", start))
