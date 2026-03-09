@@ -814,7 +814,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if lead_request_id:
                         update_data = {
                             "analisiEnergetica": analysis,
-                            "stato": "COMPLETATA",
                         }
                         if lat is not None:
                             update_data["latitudine"] = lat
