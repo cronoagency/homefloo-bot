@@ -6,6 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# procps for healthcheck (pgrep)
+RUN apt-get update && apt-get install -y --no-install-recommends procps && rm -rf /var/lib/apt/lists/*
+
 # App
 COPY homefloo-telegram-bot.py .
 
@@ -18,7 +21,7 @@ USER botuser
 
 # No port exposed — bot does polling only
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD pgrep -f homefloo-telegram-bot || exit 1
 
 CMD ["python", "homefloo-telegram-bot.py"]
