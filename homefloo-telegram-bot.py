@@ -675,12 +675,16 @@ def main():
     log.info(f"Data dir: {DATA_DIR}")
     load_sessions()
 
+    _keepwarm_task = None
+
     async def post_init(application):
-        application.keepwarm_task = asyncio.create_task(keepwarm_loop())
+        nonlocal _keepwarm_task
+        _keepwarm_task = asyncio.create_task(keepwarm_loop())
 
     async def post_shutdown(application):
-        if hasattr(application, "keepwarm_task"):
-            application.keepwarm_task.cancel()
+        nonlocal _keepwarm_task
+        if _keepwarm_task:
+            _keepwarm_task.cancel()
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
 
