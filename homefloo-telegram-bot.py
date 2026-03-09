@@ -1,22 +1,19 @@
 """
-Homefloo Telegram Bot — Ponte tra Telegram e endpoint Modal.
+Homefloo Telegram Bot — Claude Haiku per conversazione, Claude Sonnet per analisi.
 
-Qwen 3.5 9B fa la conversazione, questo script fa da ponte.
-Tiene la storia per ogni utente (multi-turno).
-Quando Qwen segnala dati completi, chiama /api/analisi per il report.
-Supporta foto e PDF bolletta — li tiene in sessione per l'analisi.
+Claude Haiku fa la conversazione e raccolta dati.
+Quando i dati sono completi, chiama /api/analisi per il report (Claude Sonnet).
+Supporta foto e PDF bolletta — estrae dati anagrafici + li tiene per l'analisi.
 
 Config via env vars:
     HOMEFLOO_TELEGRAM_TOKEN (required)
     GESTIONALE_API_KEY (required)
-    ANTHROPIC_API_KEY (optional — per estrazione dati bolletta via Claude Haiku)
-    MODAL_ENDPOINT (optional)
+    ANTHROPIC_API_KEY (required — per conversazione e estrazione bolletta)
     HOMEFLOO_API (optional)
     GESTIONALE_API (optional)
     DATA_DIR (optional, default /app/data)
 """
 
-import asyncio
 import base64
 import logging
 import json
@@ -40,11 +37,6 @@ from telegram.ext import (
 TELEGRAM_TOKEN = os.environ.get("HOMEFLOO_TELEGRAM_TOKEN", "")
 GESTIONALE_API_KEY = os.environ.get("GESTIONALE_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODAL_ENDPOINT = os.environ.get(
-    "MODAL_ENDPOINT",
-    "https://cronoagency--homefloo-bot-homefloobot-chat.modal.run",
-)
-MODAL_HEALTH_ENDPOINT = MODAL_ENDPOINT.replace("-chat.", "-health.")
 HOMEFLOO_API = os.environ.get(
     "HOMEFLOO_API",
     "http://gcgoo88g4ow8sccokc0o48c4.91.98.89.69.sslip.io/api/analisi",
@@ -53,6 +45,12 @@ GESTIONALE_API = os.environ.get(
     "GESTIONALE_API",
     "https://gestionale.homefloo.com/api/analisi-energetiche/bot",
 )
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_HEADERS = {
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json",
+}
+CHAT_MODEL = "claude-haiku-4-5-20251001"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 SESSIONS_PATH = DATA_DIR / "sessions.json"
@@ -60,11 +58,8 @@ CONV_LOG_PATH = DATA_DIR / "conversations.jsonl"
 
 MAX_HISTORY = 20  # max messaggi per sessione (10 turni user+assistant)
 SESSION_EXPIRE_HOURS = 48  # sessioni piu vecchie di 48h vengono scartate
-REQUEST_TIMEOUT = 120  # secondi (cold start puo essere 35s)
+CHAT_TIMEOUT = 30  # secondi (Claude Haiku e veloce)
 ANALISI_TIMEOUT = 180  # secondi (Claude Sonnet per analisi)
-KEEPWARM_INTERVAL = 240  # secondi (4 minuti)
-KEEPWARM_START_HOUR = 8
-KEEPWARM_END_HOUR = 21
 
 # Marker per dati completi
 DATI_PATTERN = re.compile(r"\[DATI_COMPLETI\]\s*(.*?)\s*\[/DATI_COMPLETI\]", re.DOTALL)
@@ -168,16 +163,106 @@ def extract_dati_completi(text: str) -> tuple[str, dict | None]:
         return clean_text, None
 
 
-async def call_modal(messages: list[dict]) -> str:
-    """Chiama l'endpoint Modal con la conversazione."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+HOMEFLOO_SYSTEM_PROMPT = """Sei l'assistente virtuale di Homefloo, azienda italiana specializzata in impianti fotovoltaici residenziali.
+
+OBIETTIVO: guidare il cliente verso un'analisi energetica gratuita raccogliendo i dati necessari attraverso una conversazione naturale.
+
+FLUSSO CONVERSAZIONE:
+1. Saluta e chiedi come puoi aiutare
+2. Chiedi se ha una bolletta da condividere (foto o dati)
+3. Se il cliente ha caricato la bolletta:
+   a. I dati anagrafici (nome, cognome, indirizzo) vengono estratti automaticamente dalla bolletta e ti verranno comunicati nel messaggio.
+   b. Chiedi al cliente: "Dalla bolletta risulta che l'intestatario è [Nome Cognome] con indirizzo in [Via, Città]. Sono i dati corretti da usare per l'analisi?"
+   c. Se confermati → usali e NON richiederli. Passa a raccogliere gli altri dati mancanti.
+   d. Se il cliente dice che sono diversi → chiedi i dati corretti.
+   e. NON chiedere spesa mensile né consumo — verranno estratti dalla bolletta.
+4. Se il cliente comunica dati della bolletta a voce/testo: conferma quello che hai capito.
+5. Se il cliente NON ha la bolletta E non l'ha caricata: chiedi almeno quanto spende al mese di luce (anche una stima va bene). Questo dato è ESSENZIALE — senza sapere il consumo non puoi dimensionare l'impianto. Insisti gentilmente.
+6. Raccogli SOLO i dati che NON hai già. Se dalla bolletta hai nome, cognome e indirizzo, salta quei campi. Prima di chiedere, controlla nel contesto della conversazione se il dato è già stato fornito. I dati da raccogliere (se mancanti):
+   - Spesa mensile in bolletta O consumo annuo in kWh (OBBLIGATORIO solo se NON ha caricato la bolletta)
+   - Indirizzo dell'immobile (con città e provincia)
+   - Tipo di abitazione (villetta, appartamento, casa indipendente)
+   - Tipo di tetto (piano, a falde, non lo so)
+   - Esposizione del tetto (sud, est, ovest, nord)
+   - Superficie dell'abitazione in m²
+   - Numero di persone in casa
+   - Se ha già un impianto fotovoltaico
+   - Se è interessato alla batteria di accumulo
+7. Per i dati di contatto: se hai già nome e cognome dalla bolletta e il cliente li ha confermati, chiedi SOLO telefono ed email. Se non hai nome/cognome, chiedi anche quelli.
+   Chiedi in modo naturale, ad esempio: "Per preparare il report personalizzato e poterti ricontattare, mi servirebbero un numero di telefono e un indirizzo email."
+8. SOLO quando hai TUTTI i dati (immobile + contatto), conferma il riepilogo al cliente e dì che stai preparando l'analisi dettagliata. Alla FINE del messaggio (dopo il testo visibile al cliente), aggiungi il blocco JSON:
+[DATI_COMPLETI]
+{"nome":"string","cognome":"string","telefono":"string","email":"string","spesaMensile":number_or_null,"consumoAnnuo":number_or_null,"indirizzo":"string","citta":"string","provincia":"string","tipoAbitazione":"villetta|appartamento|casa_indipendente","tipoTetto":"piano|falde|non_so","esposizioneTetto":"sud|est|ovest|nord","superficieMq":number,"numeroPersone":number,"haFotovoltaico":false,"interesseBatteria":true}
+[/DATI_COMPLETI]
+ATTENZIONE: NON aggiungere MAI il blocco [DATI_COMPLETI] se mancano nome, cognome, telefono o email. Chiedi prima i dati mancanti. Se il cliente ha caricato la bolletta, metti spesaMensile e consumoAnnuo a null.
+9. Dopo l'analisi, presenta i risultati in modo chiaro e proponi un appuntamento
+
+GESTIONE UTENTE NEGATIVO:
+- Se il cliente rifiuta di dare un dato o dice "no", NON insistere sullo stesso dato.
+- Valuta cosa hai già (dalla bolletta, dalla conversazione precedente) e cosa manca davvero.
+- Spiega in modo propositivo PERCHÉ serve quel dato specifico. Esempio: "Senza l'indirizzo non posso calcolare l'irraggiamento solare della tua zona, che è fondamentale per la stima."
+- Se il cliente rifiuta dati ESSENZIALI (indirizzo O spesa/consumo quando non ha bolletta): spiega chiaramente che senza quei dati non puoi procedere con l'analisi, ma che un consulente può aiutarlo di persona. Esempio: "Capisco, nessun problema. Purtroppo senza almeno la città non riesco a fare la stima. Se vuoi, posso farti richiamare da un nostro consulente che può aiutarti di persona — ti serve solo lasciare un recapito."
+- NON ripetere domande già fatte. Se hai già chiesto indirizzo e tipo abitazione, non rifarle.
+- I dati ESSENZIALI senza i quali non puoi procedere sono: indirizzo (o almeno città+provincia) E (bolletta OPPURE spesa mensile OPPURE consumo annuo).
+- Gli altri dati (tipo tetto, esposizione, superficie, persone) puoi stimarli con valori standard se il cliente non vuole rispondere.
+
+TONO:
+- Professionale ma accessibile, come un consulente di fiducia
+- Mai commerciale o aggressivo
+- Conservativo nelle stime
+- Rispondi SEMPRE in italiano corretto — attenzione agli articoli (UN indirizzo, UNA email, IL numero) e alle concordanze di genere
+- Risposte brevi e dirette — è una chat, non un documento
+
+REGOLE:
+- Non dare mai tempistiche di installazione
+- Non menzionare marche o modelli specifici di pannelli/inverter
+- Non garantire tempi di rientro esatti — sempre "stimato" o "indicativo"
+- Se non hai un dato, chiedi — non inventare mai
+- Se il cliente chiede qualcosa che non sai, dì che un consulente lo contatterà
+- Se il cliente va fuori tema, rispondi brevemente e riporta la conversazione sul fotovoltaico in modo naturale
+- Massimo 2-3 domande per messaggio
+- Usa emoji con moderazione
+
+DATI UTILI PER RISPOSTE RAPIDE:
+- Consumo medio famiglia italiana: 2.700 kWh/anno
+- Costo medio energia: ~0.25-0.30 euro/kWh
+- Detrazione fiscale: 50% in 10 anni (prima casa, 2026)
+- Tempo rientro tipico: 4-6 anni
+- Pannello standard: 490 Wp, minimo 8 pannelli
+- Batterie disponibili: 5, 7, 10, 14, 15, 21 kWh
+- Nord Italia: ~1.100 kWh/kWp/anno
+- Centro Italia: ~1.300 kWh/kWp/anno
+- Sud Italia e isole: ~1.500 kWh/kWp/anno"""
+
+
+async def call_claude(messages: list[dict]) -> str:
+    """Chiama Claude Haiku per la conversazione."""
+    # Filtra solo user/assistant messages
+    chat_messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in messages
+        if m.get("role") in ("user", "assistant")
+    ]
+
+    payload = {
+        "model": CHAT_MODEL,
+        "max_tokens": 1024,
+        "system": HOMEFLOO_SYSTEM_PROMPT,
+        "messages": chat_messages,
+    }
+
+    async with httpx.AsyncClient(timeout=CHAT_TIMEOUT) as client:
         response = await client.post(
-            MODAL_ENDPOINT,
-            json={"messages": messages},
+            ANTHROPIC_API_URL,
+            json=payload,
+            headers={**ANTHROPIC_HEADERS, "x-api-key": ANTHROPIC_API_KEY},
         )
         response.raise_for_status()
         data = response.json()
-        return data.get("response", "Mi dispiace, non sono riuscito a generare una risposta.")
+        content = data.get("content", [])
+        if content and content[0].get("type") == "text":
+            return content[0]["text"]
+        return "Mi dispiace, non sono riuscito a generare una risposta."
 
 
 async def find_existing_lead(chat_id: int) -> dict | None:
@@ -267,10 +352,10 @@ async def save_lead_gestionale(dati: dict, chat_id: int, messages: list[dict], e
 
 
 async def update_lead_gestionale(request_id: str, data: dict) -> bool:
-    """Aggiorna il lead nel gestionale (es. con risultato analisi)."""
+    """Aggiorna il lead nel gestionale (analisi, PDF, coordinate)."""
     try:
         payload = {"requestId": request_id, **data}
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             response = await client.put(
                 GESTIONALE_API,
                 json=payload,
@@ -568,7 +653,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["messages"] = messages
 
         await update.effective_chat.send_action("typing")
-        response_text = await call_modal(messages)
+        response_text = await call_claude(messages)
         clean_text, _ = extract_dati_completi(response_text)
 
         messages.append({"role": "assistant", "content": clean_text})
@@ -635,7 +720,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["messages"] = messages
 
         await update.effective_chat.send_action("typing")
-        response_text = await call_modal(messages)
+        response_text = await call_claude(messages)
         clean_text, _ = extract_dati_completi(response_text)
 
         messages.append({"role": "assistant", "content": clean_text})
@@ -672,10 +757,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_action("typing")
 
     try:
-        # Chiama Modal
-        response_text = await call_modal(messages)
+        # Chiama Claude Haiku
+        response_text = await call_claude(messages)
 
-        # Controlla se Qwen ha segnalato dati completi
+        # Controlla se Claude ha segnalato dati completi
         clean_text, dati = extract_dati_completi(response_text)
 
         # Salva risposta pulita nella sessione
@@ -721,13 +806,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if result and result.get("success"):
                     analysis = result.get("analysis", {})
                     pdf_b64 = result.get("reportPdfBase64")
+                    lat = result.get("latitudine")
+                    lng = result.get("longitudine")
 
-                    # Aggiorna il lead nel gestionale con il risultato
+                    # Aggiorna il lead nel gestionale con analisi + PDF + coordinate
                     if lead_request_id:
-                        await update_lead_gestionale(lead_request_id, {
+                        update_data = {
                             "analisiEnergetica": analysis,
                             "stato": "COMPLETATA",
-                        })
+                        }
+                        if lat is not None:
+                            update_data["latitudine"] = lat
+                        if lng is not None:
+                            update_data["longitudine"] = lng
+                        if pdf_b64:
+                            nome = dati.get("nome") or "Cliente"
+                            update_data["reportPdf"] = {
+                                "base64": pdf_b64,
+                                "mimeType": "application/pdf",
+                                "fileName": f"Report-{nome}-{dati.get('cognome', '')}.pdf",
+                            }
+                        await update_lead_gestionale(lead_request_id, update_data)
 
                     # Manda il report testuale
                     report = format_analisi_telegram(analysis)
@@ -776,10 +875,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
     except httpx.TimeoutException:
-        log.warning(f"[{chat_id}] Timeout da Modal")
+        log.warning(f"[{chat_id}] Timeout da Claude")
         messages.pop()
         await update.message.reply_text(
-            "Mi sto svegliando, dammi qualche secondo... Riprova tra poco!"
+            "C'e stato un problema di connessione. Riprova tra qualche secondo."
         )
 
     except Exception as e:
@@ -790,52 +889,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def keepwarm_loop():
-    """Pinga Modal health endpoint ogni 4 min (8-21) per evitare cold start."""
-    import datetime
-    log.info(f"Keepwarm loop avviato (ogni {KEEPWARM_INTERVAL}s, ore {KEEPWARM_START_HOUR}-{KEEPWARM_END_HOUR})")
-    while True:
-        try:
-            await asyncio.sleep(KEEPWARM_INTERVAL)
-            hour = datetime.datetime.now().hour
-            if hour < KEEPWARM_START_HOUR or hour >= KEEPWARM_END_HOUR:
-                continue
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.get(MODAL_HEALTH_ENDPOINT)
-                if resp.status_code != 200:
-                    log.warning(f"Keepwarm FAIL: HTTP {resp.status_code}")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            log.warning(f"Keepwarm error: {e}")
-
-
 def main():
     """Avvia il bot."""
     if not TELEGRAM_TOKEN:
         raise RuntimeError("HOMEFLOO_TELEGRAM_TOKEN env var is required")
     if not GESTIONALE_API_KEY:
         raise RuntimeError("GESTIONALE_API_KEY env var is required")
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY env var is required")
 
     log.info("Avvio Homefloo Telegram Bot...")
-    log.info(f"Endpoint Modal: {MODAL_ENDPOINT}")
+    log.info(f"Chat model: {CHAT_MODEL}")
     log.info(f"Analisi API: {HOMEFLOO_API}")
     log.info(f"Gestionale API: {GESTIONALE_API}")
     log.info(f"Data dir: {DATA_DIR}")
     load_sessions()
 
-    _keepwarm_task = None
-
-    async def post_init(application):
-        nonlocal _keepwarm_task
-        _keepwarm_task = asyncio.create_task(keepwarm_loop())
-
-    async def post_shutdown(application):
-        nonlocal _keepwarm_task
-        if _keepwarm_task:
-            _keepwarm_task.cancel()
-
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Comandi
     app.add_handler(CommandHandler("start", start))
