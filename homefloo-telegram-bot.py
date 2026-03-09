@@ -9,6 +9,7 @@ Supporta foto e PDF bolletta — li tiene in sessione per l'analisi.
 Config via env vars:
     HOMEFLOO_TELEGRAM_TOKEN (required)
     GESTIONALE_API_KEY (required)
+    ANTHROPIC_API_KEY (optional — per estrazione dati bolletta via Claude Haiku)
     MODAL_ENDPOINT (optional)
     HOMEFLOO_API (optional)
     GESTIONALE_API (optional)
@@ -38,6 +39,7 @@ from telegram.ext import (
 # --- Config from env vars ---
 TELEGRAM_TOKEN = os.environ.get("HOMEFLOO_TELEGRAM_TOKEN", "")
 GESTIONALE_API_KEY = os.environ.get("GESTIONALE_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODAL_ENDPOINT = os.environ.get(
     "MODAL_ENDPOINT",
     "https://cronoagency--homefloo-bot-homefloobot-chat.modal.run",
@@ -385,6 +387,115 @@ async def download_telegram_file(bot, file_id: str) -> bytes:
     return bio.read()
 
 
+async def extract_bill_header(file_bytes: bytes, mime_type: str) -> dict | None:
+    """Estrae nome, cognome, indirizzo dalla bolletta via Claude Haiku.
+
+    Ritorna dict con i campi estratti o None se fallisce.
+    """
+    if not ANTHROPIC_API_KEY:
+        log.warning("ANTHROPIC_API_KEY non configurata — skip estrazione bolletta")
+        return None
+
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+
+    # Per PDF usa document type, per immagini usa image type
+    if mime_type == "application/pdf":
+        content_block = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": mime_type, "data": b64},
+        }
+    else:
+        content_block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime_type, "data": b64},
+        }
+
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 256,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    content_block,
+                    {
+                        "type": "text",
+                        "text": (
+                            "Estrai dall'intestazione di questa bolletta elettrica/gas i seguenti dati. "
+                            "Rispondi SOLO con un JSON valido, senza altro testo.\n"
+                            '{"nome": "...", "cognome": "...", "indirizzo": "...", "citta": "...", "provincia": "..."}\n'
+                            "Se un campo non è leggibile, metti null."
+                        ),
+                    },
+                ],
+            }
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                json=payload,
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+            )
+            if resp.status_code != 200:
+                log.warning(f"Claude Haiku errore: {resp.status_code} {resp.text[:200]}")
+                return None
+
+            data = resp.json()
+            text = data.get("content", [{}])[0].get("text", "")
+            # Pulizia: rimuovi eventuale markdown code block
+            text = text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            result = json.loads(text)
+            log.info(f"Dati estratti dalla bolletta: {result}")
+            return result
+
+    except json.JSONDecodeError as e:
+        log.warning(f"JSON non valido da Claude Haiku: {e}")
+        return None
+    except Exception as e:
+        log.warning(f"Errore estrazione bolletta: {e}")
+        return None
+
+
+def format_bill_injection(extracted: dict) -> str:
+    """Formatta i dati estratti dalla bolletta per l'iniezione nel messaggio a Qwen."""
+    parts = []
+    nome = extracted.get("nome")
+    cognome = extracted.get("cognome")
+    if nome or cognome:
+        intestatario = f"{nome or ''} {cognome or ''}".strip()
+        parts.append(f"- Intestatario: {intestatario}")
+    indirizzo = extracted.get("indirizzo")
+    if indirizzo:
+        parts.append(f"- Indirizzo: {indirizzo}")
+    citta = extracted.get("citta")
+    provincia = extracted.get("provincia")
+    if citta:
+        loc = citta
+        if provincia:
+            loc += f" ({provincia})"
+        parts.append(f"- Località: {loc}")
+
+    if not parts:
+        return ""
+
+    return (
+        "[L'utente ha caricato la bolletta. Dati estratti dalla bolletta:\n"
+        + "\n".join(parts) + "\n"
+        "Chiedi all'utente se questi dati anagrafici sono corretti per l'analisi. "
+        "Se confermati, NON chiederli di nuovo. Se l'utente dice che sono diversi, chiedi quelli giusti.\n"
+        "Spesa e consumo verranno estratti automaticamente — NON chiederli.]"
+    )
+
+
 # --- Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -431,9 +542,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info(f"[{chat_id}] Foto bolletta salvata: {len(file_bytes)} bytes")
         log_conversation(chat_id, "user", "[FOTO BOLLETTA]", extra={"file_size": len(file_bytes)})
 
-        # Di a Qwen che l'utente ha mandato la bolletta
+        # Estrai dati anagrafici dalla bolletta via Claude Haiku
+        await update.effective_chat.send_action("typing")
+        extracted = await extract_bill_header(file_bytes, "image/jpeg")
+
+        # Costruisci messaggio per Qwen con dati estratti (o fallback generico)
+        if extracted:
+            injection = format_bill_injection(extracted)
+            log_conversation(chat_id, "system", "BILL_EXTRACTED", extra={"data": extracted})
+        else:
+            injection = ""
+
+        if injection:
+            user_msg = injection
+        else:
+            user_msg = (
+                "[L'utente ha caricato una foto della bolletta. La bolletta verra analizzata automaticamente "
+                "— NON chiedere spesa mensile ne consumo annuo, quei dati verranno estratti dalla bolletta. "
+                "Conferma la ricezione e continua a raccogliere gli ALTRI dati necessari (indirizzo, tipo abitazione, tetto, ecc.).]"
+            )
+
         messages = session["messages"]
-        messages.append({"role": "user", "content": "[L'utente ha caricato una foto della bolletta. La bolletta verra analizzata automaticamente — NON chiedere spesa mensile ne consumo annuo, quei dati verranno estratti dalla bolletta. Conferma la ricezione e continua a raccogliere gli ALTRI dati necessari (indirizzo, tipo abitazione, tetto, ecc.).]"})
+        messages.append({"role": "user", "content": user_msg})
         messages = trim_session(messages)
         session["messages"] = messages
 
@@ -480,8 +610,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info(f"[{chat_id}] Documento salvato: {doc.file_name} ({len(file_bytes)} bytes, {mime})")
         log_conversation(chat_id, "user", f"[DOCUMENTO: {doc.file_name}]", extra={"file_size": len(file_bytes), "mime": mime})
 
+        # Estrai dati anagrafici dalla bolletta via Claude Haiku
+        await update.effective_chat.send_action("typing")
+        extracted = await extract_bill_header(file_bytes, mime)
+
+        if extracted:
+            injection = format_bill_injection(extracted)
+            log_conversation(chat_id, "system", "BILL_EXTRACTED", extra={"data": extracted})
+        else:
+            injection = ""
+
+        if injection:
+            user_msg = injection
+        else:
+            user_msg = (
+                f"[L'utente ha caricato la bolletta come {mime.split('/')[-1].upper()}. La bolletta verra analizzata automaticamente "
+                "— NON chiedere spesa mensile ne consumo annuo, quei dati verranno estratti dalla bolletta. "
+                "Conferma la ricezione e continua a raccogliere gli ALTRI dati necessari (indirizzo, tipo abitazione, tetto, ecc.).]"
+            )
+
         messages = session["messages"]
-        messages.append({"role": "user", "content": f"[L'utente ha caricato la bolletta come {mime.split('/')[-1].upper()}. La bolletta verra analizzata automaticamente — NON chiedere spesa mensile ne consumo annuo, quei dati verranno estratti dalla bolletta. Conferma la ricezione e continua a raccogliere gli ALTRI dati necessari (indirizzo, tipo abitazione, tetto, ecc.).]"})
+        messages.append({"role": "user", "content": user_msg})
         messages = trim_session(messages)
         session["messages"] = messages
 
