@@ -810,7 +810,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lat = result.get("latitudine")
                     lng = result.get("longitudine")
 
-                    # Aggiorna il lead nel gestionale con analisi + PDF + coordinate
+                    # Aggiorna il lead nel gestionale con analisi + PDF + bolletta + coordinate
                     if lead_request_id:
                         update_data = {
                             "analisiEnergetica": analysis,
@@ -826,6 +826,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 "base64": pdf_b64,
                                 "mimeType": "application/pdf",
                                 "fileName": f"Report-{nome}-{dati.get('cognome', '')}.pdf",
+                            }
+                        # Manda anche la bolletta originale
+                        file_data_session = session.get("file")
+                        if file_data_session and file_data_session.get("bytes"):
+                            update_data["fileBolletta"] = {
+                                "base64": base64.b64encode(file_data_session["bytes"]).decode("utf-8"),
+                                "mimeType": file_data_session.get("mime_type", "image/jpeg"),
+                                "fileName": file_data_session.get("filename", "bolletta"),
                             }
                         await update_lead_gestionale(lead_request_id, update_data)
 
