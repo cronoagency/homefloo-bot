@@ -39,7 +39,7 @@ GESTIONALE_API_KEY = os.environ.get("GESTIONALE_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 HOMEFLOO_API = os.environ.get(
     "HOMEFLOO_API",
-    "http://gcgoo88g4ow8sccokc0o48c4.91.98.89.69.sslip.io/api/analisi",
+    "https://homefloo.com/api/analisi",
 )
 GESTIONALE_API = os.environ.get(
     "GESTIONALE_API",
