@@ -163,6 +163,124 @@ def extract_dati_completi(text: str) -> tuple[str, dict | None]:
         return clean_text, None
 
 
+# --- Validazione dei dati che arrivano dal marker ---
+# Il JSON del marker lo scrive il modello, che a sua volta legge messaggi e
+# bollette di chiunque: e testo, non struttura. Da qui esce un lead nel
+# gestionale e una chiamata di analisi, quindi passa da una whitelist prima di
+# diventare azione. La whitelist DEGRADA (scarta il campo storto) invece di
+# sollevare: perdere un lead vero per un campo malformato sarebbe un danno
+# peggiore del campo malformato, e a valle ogni campo ha gia il suo default.
+
+DATI_STRINGA = {  # campo -> lunghezza massima
+    "nome": 100, "cognome": 100, "telefono": 32, "email": 254,
+    "indirizzo": 200, "citta": 80, "provincia": 40,
+}
+DATI_ENUM = {
+    "tipoAbitazione": {"villetta", "appartamento", "casa_indipendente", "altro"},
+    "tipoTetto": {"piano", "falde", "non_so"},
+    "esposizioneTetto": {"sud", "est", "ovest", "nord", "non_so"},
+}
+DATI_NUMERO = {  # campo -> (minimo, massimo) plausibili
+    "spesaMensile": (0, 100_000),
+    "consumoAnnuo": (0, 1_000_000),
+    "superficieMq": (1, 10_000),
+    "numeroPersone": (1, 50),
+}
+DATI_BOOL = {"haFotovoltaico", "interesseBatteria", "disponeBolletta"}
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+TELEFONO_PULIZIA_RE = re.compile(r"[^0-9+\s\-/().]")
+CONTROLLI_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _stringa_pulita(valore, maxlen: int) -> str | None:
+    """Accetta solo testo breve e senza caratteri di controllo. None = scarta."""
+    if isinstance(valore, bool) or not isinstance(valore, (str, int, float)):
+        return None
+    testo = CONTROLLI_RE.sub(" ", str(valore)).strip()
+    return testo[:maxlen] if testo else None
+
+
+def _numero_pulito(valore, minimo, massimo) -> int | float | None:
+    if isinstance(valore, bool):
+        return None
+    if isinstance(valore, str):
+        try:
+            valore = float(valore.replace(",", ".").strip())
+        except ValueError:
+            return None
+    if not isinstance(valore, (int, float)):
+        return None
+    if not (minimo <= valore <= massimo):
+        return None
+    return int(valore) if float(valore).is_integer() else valore
+
+
+def validate_dati(dati: dict) -> dict:
+    """Filtra il JSON del marker: solo campi noti, tipi giusti, misure sensate."""
+    if not isinstance(dati, dict):
+        log.warning(f"DATI_COMPLETI non e un oggetto ({type(dati).__name__}): scartato tutto")
+        return {}
+
+    puliti: dict = {}
+    scartati: list[str] = []
+
+    for campo, maxlen in DATI_STRINGA.items():
+        if campo not in dati or dati[campo] is None:
+            continue
+        testo = _stringa_pulita(dati[campo], maxlen)
+        if testo is None:
+            scartati.append(campo)
+            continue
+        if campo == "email" and not EMAIL_RE.match(testo):
+            scartati.append("email")
+            continue
+        if campo == "telefono":
+            testo = TELEFONO_PULIZIA_RE.sub("", testo).strip()
+            if not any(c.isdigit() for c in testo):
+                scartati.append("telefono")
+                continue
+        puliti[campo] = testo
+
+    for campo, ammessi in DATI_ENUM.items():
+        if campo not in dati or dati[campo] is None:
+            continue
+        valore = dati[campo]
+        if isinstance(valore, str) and valore.strip().lower() in ammessi:
+            puliti[campo] = valore.strip().lower()
+        else:
+            scartati.append(campo)
+
+    for campo, (minimo, massimo) in DATI_NUMERO.items():
+        if campo not in dati or dati[campo] is None:
+            continue
+        numero = _numero_pulito(dati[campo], minimo, massimo)
+        if numero is None:
+            scartati.append(campo)
+        else:
+            puliti[campo] = numero
+
+    for campo in DATI_BOOL:
+        if campo not in dati or dati[campo] is None:
+            continue
+        valore = dati[campo]
+        if isinstance(valore, bool):
+            puliti[campo] = valore
+        elif isinstance(valore, str) and valore.strip().lower() in ("true", "false"):
+            puliti[campo] = valore.strip().lower() == "true"
+        else:
+            scartati.append(campo)
+
+    ignorati = [k for k in dati if k not in DATI_STRINGA and k not in DATI_ENUM
+                and k not in DATI_NUMERO and k not in DATI_BOOL]
+    if scartati or ignorati:
+        log.warning(
+            f"DATI_COMPLETI ripuliti — campi scartati: {scartati or '-'} | "
+            f"chiavi non previste ignorate: {ignorati or '-'}"
+        )
+    return puliti
+
+
 HOMEFLOO_SYSTEM_PROMPT = """Sei l'assistente virtuale di Homefloo, azienda italiana specializzata in impianti fotovoltaici residenziali.
 
 OBIETTIVO: guidare il cliente verso un'analisi energetica gratuita raccogliendo i dati necessari attraverso una conversazione naturale.
@@ -551,19 +669,37 @@ async def extract_bill_header(file_bytes: bytes, mime_type: str) -> dict | None:
         return None
 
 
+def _campo_bolletta(valore, maxlen: int = 120) -> str:
+    """Ripulisce un valore letto dalla bolletta prima di metterlo nel prompt.
+
+    Il blocco costruito qui sotto contiene ISTRUZIONI per il modello ed e
+    delimitato da parentesi quadre, mentre questi valori arrivano da un file
+    caricato da chiunque. Una quadra o un a capo dentro il valore chiudono il
+    blocco e quello che segue viene letto come istruzione: quindi quadre e
+    caratteri di controllo non passano, e la lunghezza e limitata.
+    """
+    if valore is None or isinstance(valore, bool) or not isinstance(valore, (str, int, float)):
+        return ""
+    testo = str(valore)
+    testo = CONTROLLI_RE.sub(" ", testo)
+    testo = testo.replace("[", "(").replace("]", ")")
+    testo = " ".join(testo.split())
+    return testo[:maxlen]
+
+
 def format_bill_injection(extracted: dict) -> str:
     """Formatta i dati estratti dalla bolletta per l'iniezione nel messaggio a Qwen."""
     parts = []
-    nome = extracted.get("nome")
-    cognome = extracted.get("cognome")
+    nome = _campo_bolletta(extracted.get("nome"))
+    cognome = _campo_bolletta(extracted.get("cognome"))
     if nome or cognome:
-        intestatario = f"{nome or ''} {cognome or ''}".strip()
+        intestatario = f"{nome} {cognome}".strip()
         parts.append(f"- Intestatario: {intestatario}")
-    indirizzo = extracted.get("indirizzo")
+    indirizzo = _campo_bolletta(extracted.get("indirizzo"), 200)
     if indirizzo:
         parts.append(f"- Indirizzo: {indirizzo}")
-    citta = extracted.get("citta")
-    provincia = extracted.get("provincia")
+    citta = _campo_bolletta(extracted.get("citta"), 80)
+    provincia = _campo_bolletta(extracted.get("provincia"), 40)
     if citta:
         loc = citta
         if provincia:
@@ -762,7 +898,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response_text = await call_claude(messages)
 
         # Controlla se Claude ha segnalato dati completi
-        clean_text, dati = extract_dati_completi(response_text)
+        clean_text, dati_grezzi = extract_dati_completi(response_text)
+
+        # Il marker lo emette il modello: prima che diventi un lead nel
+        # gestionale e una chiamata di analisi, passa dalla whitelist.
+        dati = None
+        if dati_grezzi is not None:
+            dati = validate_dati(dati_grezzi)
+            # Senza almeno un contatto non e un lead: non si scrive e non si
+            # spende un'analisi. Finora questo controllo era solo una frase nel
+            # system prompt, cioe affidato al modello.
+            if not (dati.get("email") or dati.get("telefono")):
+                log.warning(
+                    f"[{chat_id}] DATI_COMPLETI senza contatto valido dopo la validazione: "
+                    f"nessun lead, nessuna analisi. Campi rimasti: {sorted(dati)}"
+                )
+                log_conversation(chat_id, "system", "DATI_SCARTATI", extra={"campi": sorted(dati)})
+                dati = None
 
         # Salva risposta pulita nella sessione
         messages.append({"role": "assistant", "content": clean_text})
